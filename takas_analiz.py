@@ -401,6 +401,12 @@ def analiz(veri, hisse, esik, top, gunici=None):
         print(f"  – {s}")
     print("\n(Bu kurallar uydurulmadı; veri olmadığı için hesaplanmadı.)")
 
+    # --- KOORDİNELİ KURUM KÜMESİ (yeni özellik) ------------------------- #
+    baslik("[♦] KOORDİNELİ KURUM KÜMESİ ŞÜPHESİ — aynı yön + dar maliyet bandı + yüksek hacim")
+    print("Mantık: tek el lotu çok kuruma dağıtır. Dar maliyet bandında eşgüdümlü 3+ kurum = koordine şüphesi.")
+    print("Büyük bankalar doğal benzeşir (büyüklük yan etkisi); ASIL sinyal küçük/orta kurum kümesidir.")
+    koordine_ozet = koordine_kume_bolumu(veri, hisse or "tek dönem")
+
     # --- ÇAPRAZ DOĞRULAMA (Modül 4 / Faz 3) ----------------------------- #
     sinyaller = {}
     for k in cikislar:
@@ -436,6 +442,7 @@ def analiz(veri, hisse, esik, top, gunici=None):
         "net_alici": net_alici_bulgu,
         "net_satici": net_satici_bulgu,
         "guven": guven,
+        "koordine": koordine_ozet,
     }
 
 
@@ -522,8 +529,89 @@ def defter_yaz(bulgu, aralik):
         f"- **Net alıcı (ilk 3):**\n{_liste(bulgu['net_alici'])}",
         f"- **Net satıcı (ilk 3):**\n{_liste(bulgu['net_satici'])}",
         f"- **📌 Güven özeti:** {bulgu.get('guven') or '(yok)'}",
+        f"- **♦ Koordine küme (büyük banka dışı):**\n{_liste(bulgu.get('koordine') or [])}",
     ]
     return _defter_ekle(bulgu["hisse"], ana, govde)
+
+
+# ------------------------------------------------------------------ #
+# KOORDİNELİ KURUM KÜMESİ TESPİTİ
+# aynı yön + dar maliyet bandı + yüksek hacim = tek elin çok kurumu
+# eşgüdümlü kullanması şüphesi. Büyük bankalar doğal benzeşir → ayrılır.
+# ------------------------------------------------------------------ #
+# En büyük yerli banka/aracılar: her hissede üst sıradadır, benzer hareketleri
+# koordinasyon değil "büyük olmanın" yan etkisidir; güçlü sinyalden hariç tutulur.
+BUYUK_BANKA = [
+    "GARANTI", "AKBANK", "AK", "IS", "YAPI KREDI", "ZIRAAT", "VAKIF", "HALK",
+    "DENIZ", "QNB", "ING", "TEB", "GEDIK", "OYAK",
+]
+
+
+def buyuk_banka_mi(ad):
+    u = " ".join(ad.upper().split())
+    return any(u == b or u.startswith(b + " ") for b in BUYUK_BANKA)
+
+
+def _kume_hacim(kume):
+    return sum(abs(k["adet_fark"] or 0) for k in kume)
+
+
+def _yogun_kume(grp, band_orani):
+    """Maliyeti tanımlı kurumlar içinde, ±band_orani genişliğinde EN YOĞUN
+    (en çok kurum, eşitlikte en çok hacim) maliyet penceresini bul. 3+ ise döndür."""
+    grp = [k for k in grp if (k["maliyet"] or 0) > 0]
+    if len(grp) < 3:
+        return None
+    best = []
+    for merkez in grp:
+        m = merkez["maliyet"]
+        lo, hi = m * (1 - band_orani), m * (1 + band_orani)
+        pencere = [k for k in grp if lo <= (k["maliyet"] or 0) <= hi]
+        if (len(pencere), _kume_hacim(pencere)) > (len(best), _kume_hacim(best)):
+            best = pencere
+    return best if len(best) >= 3 else None
+
+
+def _kume_yaz(onek, kume):
+    if not kume:
+        print(onek + "belirgin koordine küme yok")
+        return None
+    aw = _kume_hacim(kume)
+    ort = sum(abs(k["adet_fark"]) * k["maliyet"] for k in kume) / aw if aw else 0
+    mals = sorted(k["maliyet"] for k in kume)
+    print(onek + f"{len(kume)} kurum, ort maliyet ~{fmt(ort,2)} "
+          f"(band {fmt(mals[0],2)}–{fmt(mals[-1],2)}), toplam {fmt(aw)} lot")
+    for k in sorted(kume, key=lambda x: -abs(x["adet_fark"] or 0)):
+        print(f"          {k['ad']:<20} Adet Fark {fmt(k['adet_fark']):>14} | maliyet {fmt(k['maliyet'],2)}")
+    return ort
+
+
+def koordine_kume_bolumu(kurumlar, etiket, hacim_orani=0.03, band_orani=0.02):
+    """Bir dönemin kurumlarında koordine küme arar. Deftere yazılacak özet str listesi döner."""
+    yerli = [k for k in kurumlar if k.get("tip") != "yabanci"]
+    toplam = sum(abs(k.get("adet_fark") or 0) for k in yerli)
+    print(f"\n  ── Dönem: {etiket} ──")
+    if toplam <= 0:
+        print("    (yerli kurum hareketi yok)")
+        return []
+    esik = hacim_orani * toplam
+    print(f"    Yüksek hacim eşiği: |Adet Fark| ≥ {fmt(esik)} lot "
+          f"(dönem hareketinin %{hacim_orani*100:g}'i) | maliyet bandı ±%{band_orani*100:g}")
+
+    ozet = []
+    for yon, etlbl in ((1, "ALICI"), (-1, "SATICI")):
+        buyuk_dahil = [k for k in yerli
+                       if (k.get("adet_fark") or 0) * yon > 0 and abs(k["adet_fark"]) >= esik]
+        digerleri = [k for k in buyuk_dahil if not buyuk_banka_mi(k["ad"])]
+        print(f"\n    {etlbl} yönünde yüksek hacimli yerli: {len(buyuk_dahil)} kurum")
+        _kume_yaz("      (a) tüm (büyük banka dahil, zayıf/bilgi): ", _yogun_kume(buyuk_dahil, band_orani))
+        kucuk = _yogun_kume(digerleri, band_orani)
+        ort = _kume_yaz("      (b) büyük banka DIŞI [GÜÇLÜ sinyal]: ", kucuk)
+        if kucuk:
+            adlar = ", ".join(k["ad"] for k in sorted(kucuk, key=lambda x: -abs(x["adet_fark"])))
+            ozet.append(f"{etiket} {etlbl}: {len(kucuk)} küçük/orta kurum ~{fmt(ort,2)} maliyette dar bantta "
+                        f"({adlar})")
+    return ozet
 
 
 # ------------------------------------------------------------------ #
@@ -633,6 +721,7 @@ def karsilastir(dosya_etiketler, hisse, aralik=None, top=15):
         araliklar.append({
             "etiket": etiket,
             "toplam": toplam,
+            "veri": veri,
             "af": {k["key"]: (k["adet_fark"] or 0) for k in veri},
             "takas_son": {k["key"]: (k["takas_son"] or 0) for k in veri},
             "ad": {k["key"]: k["ad"] for k in veri},
@@ -740,6 +829,14 @@ def karsilastir(dosya_etiketler, hisse, aralik=None, top=15):
     else:
         print("  (yerli kurum yok)")
 
+    # --- KOORDİNELİ KURUM KÜMESİ (her dönemde ayrı) --------------------- #
+    baslik("[♦] KOORDİNELİ KURUM KÜMESİ ŞÜPHESİ — aynı yön + dar maliyet bandı + yüksek hacim")
+    print("Mantık: tek el lotu çok kuruma dağıtır. Dar maliyet bandında eşgüdümlü 3+ kurum = koordine şüphesi.")
+    print("Büyük bankalar doğal benzeşir (büyüklük yan etkisi); ASIL sinyal küçük/orta kurum kümesidir.")
+    koordine_ozet = []
+    for iv in araliklar:
+        koordine_ozet += koordine_kume_bolumu(iv["veri"], iv["etiket"])
+
     # --- ÇAPRAZ DOĞRULAMA (Modül 4 / Faz 3) ----------------------------- #
     sinyaller = {}
     for s in kalici:
@@ -783,6 +880,7 @@ def karsilastir(dosya_etiketler, hisse, aralik=None, top=15):
         f"- **Yabancı/saklama (mekanik, elendi):**\n{_liste(mekanik_l)}",
         f"- **En dar aralıkta en hareketli yerliler:**\n{_liste(hareketli_l)}",
         f"- **📌 Güven özeti:** {guven}",
+        f"- **♦ Koordine küme (büyük banka dışı):**\n{_liste(koordine_ozet)}",
     ]
     yol = _defter_ekle(hisse, ana, govde, baslik_eki=" (ÇOKLU ARALIK KARŞILAŞTIRMA)")
     print(f"\n→ {yol} dosyasına kaydedildi.")
