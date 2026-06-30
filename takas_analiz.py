@@ -149,14 +149,18 @@ def gunici_oku(yol):
 
     i_kurum = bul("ARACI") or bul("KURUM") or bul("AÇIKLAMA") or bul("ACIKLAMA") or 0
     i_net = bul("NET")  # 'Net', 'Net Lot', 'Net Adet'...
-    i_alis = bul("ALI", "LOT") or bul("ALI", "ADET") or bul("ALIŞ")
-    i_satis = bul("SAT", "LOT") or bul("SAT", "ADET") or bul("SATIŞ")
+    # "Alış Lot"/"Alış Adet"/"Alış"/"Alım" hepsini yakala (kolon adı formata göre değişir)
+    i_alis = (bul("ALI", "LOT") or bul("ALI", "ADET") or bul("ALIŞ")
+              or bul("ALIM") or bul("ALI"))
+    i_satis = (bul("SAT", "LOT") or bul("SAT", "ADET") or bul("SATIŞ")
+               or bul("SATIM") or bul("SAT"))
 
     if i_net is None and (i_alis is None or i_satis is None):
         sys.exit("HATA: gün içi CSV'de 'Net' ya da 'Alış/Satış Lot' kolonu bulunamadı.\n"
                  f"       Bulunan başlıklar: {satirlar[0]}")
 
     net_map, ad_map = {}, {}
+    alis_map, satis_map = {}, {}
     for r in satirlar[1:]:
         if not r or i_kurum >= len(r) or not r[i_kurum].strip():
             continue
@@ -173,10 +177,16 @@ def gunici_oku(yol):
             net = 0.0
         net_map[norm_ad(ad)] = net
         ad_map[norm_ad(ad)] = ad
+        # "Alan var satan yok" anomalisi için toplam alış/satış (varsa)
+        if i_alis is not None and i_alis < len(r):
+            alis_map[norm_ad(ad)] = tr_sayi(r[i_alis])
+        if i_satis is not None and i_satis < len(r):
+            satis_map[norm_ad(ad)] = tr_sayi(r[i_satis])
     if not net_map:
         sys.exit("HATA: gün içi CSV'de işlenebilir kurum satırı yok.")
     yontem = "Net kolonu" if i_net is not None else "Alış Lot − Satış Lot"
-    return net_map, ad_map, yontem
+    # alis/satis_map boş olabilir (yalnız Net kolonu varsa); o zaman anomali atlanır
+    return net_map, ad_map, yontem, alis_map, satis_map
 
 
 # ------------------------------------------------------------------ #
@@ -184,6 +194,10 @@ def baslik(metin):
     print("\n" + "=" * 70)
     print(metin)
     print("=" * 70)
+
+
+def baslik_str(metin):
+    return "=" * 70 + "\n" + metin + "\n" + "=" * 70
 
 
 def virman_skoru(k, toplam_takas):
@@ -264,6 +278,144 @@ def kesin_virman_bolumu(veri, net_map, ad_map, yontem, toplam_takas, top):
 
 
 # ------------------------------------------------------------------ #
+# ================================================================== #
+# YENİ ÖZELLİKLER (Anayasa / ANA_MANTIK.md ile uyum)
+# ================================================================== #
+
+def alan_satan_anomalisi(alis_map, satis_map, ad_map, top=10):
+    """BOYUT 1/Adet farkı: 'Alan var satan yok' → dolaşıma giriş/bölünme şüphesi.
+    AKD'de bir kurum kocaman alıcı ama tahtanın TOPLAM satışı çok küçükse,
+    o lot piyasadan değil dolaşımdan/bölünmeden gelmiş olabilir."""
+    if not alis_map or not satis_map:
+        return None  # alış/satış kolonu yok → anomali hesaplanamaz
+    top_alis = sum(v for v in alis_map.values() if v and v > 0)
+    top_satis = sum(v for v in satis_map.values() if v and v > 0)
+    if top_alis <= 0:
+        return None
+    satis_oran = top_satis / top_alis if top_alis else 1.0
+    # En büyük net alıcılar
+    buyuk_alicilar = []
+    for k, alis in alis_map.items():
+        net = (alis or 0) - (satis_map.get(k, 0) or 0)
+        if net > 0:
+            buyuk_alicilar.append((ad_map.get(k, k), net, alis or 0))
+    buyuk_alicilar.sort(key=lambda x: -x[1])
+    return {
+        "toplam_alis": top_alis, "toplam_satis": top_satis,
+        "satis_oran": satis_oran, "buyuk_alicilar": buyuk_alicilar[:top],
+        # Anomali: toplam satış, toplam alışın %30'undan azsa "alan çok satan az"
+        "anomali": satis_oran < 0.30,
+    }
+
+
+def cep_olayi_kontrol(veriler_aralikli):
+    """CEP OLAYI: maliyeti yapay yükseltip dağıtım.
+    Birden çok aralık verisi gerektirir (geçmiş vs şimdi maliyet uçurumu).
+    veriler_aralikli: [(etiket, {key: {ad, maliyet, adet_fark, takas_son}}), ...] geniş→dar.
+    Geçmişte düşük maliyetli büyük toplama VARKEN, dar/son dönemde aynı kurum(lar)
+    çok daha yüksek maliyetten 'yeni' görünüyorsa → cep olayı şüphesi."""
+    if len(veriler_aralikli) < 2:
+        return None
+    genis_et, genis = veriler_aralikli[0]
+    dar_et, dar = veriler_aralikli[-1]
+    supheliler = []
+    for key, dv in dar.items():
+        gv = genis.get(key)
+        if not gv:
+            continue
+        gm = gv.get("maliyet") or 0
+        dm = dv.get("maliyet") or 0
+        # Maliyet uçurumu: dar dönem maliyeti, geniş döneminkinden belirgin yüksek
+        # ve geçmişte de pozisyon/alım varmış (yani eski düşük maliyetli mal mevcut)
+        if gm > 0 and dm > 0 and dm >= gm * 1.30 and (gv.get("takas_son") or 0) > 0:
+            supheliler.append({
+                "ad": dv.get("ad") or gv.get("ad") or key,
+                "eski_maliyet": gm, "yeni_maliyet": dm,
+                "ucurum_kat": dm / gm,
+            })
+    supheliler.sort(key=lambda x: -x["ucurum_kat"])
+    return supheliler if supheliler else None
+
+
+def sentez_uret(bulgu):
+    """SENTEZ (aracın kalbi): boyutları 5 soru sırasıyla bir resme bağlar.
+    Soru1: oyuncu var mı → Soru2: kim → Soru3: evre → Soru4: gizli mi → Soru5: resim.
+    OLGUSAL ham sentez döner (karar/al-sat YOK)."""
+    satirlar = []
+    oyuncular = bulgu.get("oyuncular") or []
+    net_alici = bulgu.get("net_alici") or []
+    net_satici = bulgu.get("net_satici") or []
+    koordine = bulgu.get("koordine") or []
+    virman = bulgu.get("virman_list") or []
+    eksi = bulgu.get("eksi_takas") or []
+    maliyet_bandi = bulgu.get("maliyet_bandi")
+    patron_cikis = bulgu.get("patron_cikis") or []
+
+    # Soru 1 — Oyuncu var mı?
+    if not oyuncular and not net_alici and not net_satici:
+        satirlar.append("Soru1 [Oyuncu?]: Belirgin hakim/aktif oyuncu YOK → dağınık/sahipsiz tahta görünümü.")
+        satirlar.append("→ Bu tahtada takip edilecek net bir el görünmüyor; sahipsiz tahtaya çizgi çekilmez.")
+        return satirlar
+    satirlar.append(f"Soru1 [Oyuncu?]: Takip edilebilir aktör(ler) VAR "
+                    f"(maliyetli oyuncu: {len(oyuncular)}, net alıcı: {len(net_alici)}, net satıcı: {len(net_satici)}).")
+
+    # Soru 2 — Kim ve nasıl biri? (en güçlü oyuncu + maliyeti)
+    if oyuncular:
+        en = oyuncular[0]
+        satirlar.append(f"Soru2 [Kim?]: Öne çıkan oyuncu {en.get('ad')} "
+                        f"(takas {fmt(en.get('takas_son'))} lot, maliyet {fmt(en.get('maliyet'),2)}).")
+    if maliyet_bandi:
+        satirlar.append(f"        Hayat çizgisi (net alıcı ağırlıklı maliyet): {maliyet_bandi} "
+                        f"→ fiyat bunun altına inerse oyuncu(lar) zararda.")
+
+    # Soru 3 — Hangi evrede? (net alıcı mı satıcı mı baskın + yön değişimi)
+    na = len(net_alici); ns = len(net_satici)
+    if patron_cikis:
+        satirlar.append(f"Soru3 [Evre?]: Tek kurumda büyük ÇIKIŞ var ({len(patron_cikis)} kurum) "
+                        f"→ DAĞITIM/boşaltma evresi olabilir (dikkat).")
+    elif na > ns:
+        satirlar.append("Soru3 [Evre?]: Net alıcılar baskın → TOPLAMA/giriş ağırlıklı görünüm.")
+    elif ns > na:
+        satirlar.append("Soru3 [Evre?]: Net satıcılar baskın → DAĞITIM/çıkış ağırlıklı görünüm.")
+    else:
+        satirlar.append("Soru3 [Evre?]: Alıcı/satıcı dengeli → belirsiz/yatay evre.")
+
+    # Soru 4 — Gizleniyor mu, yalnız mı?
+    gizlilik = []
+    if virman:
+        gizlilik.append(f"virman/iz gizleme ({len(virman)} kurum)")
+    if eksi:
+        gizlilik.append(f"eksi takas ({len(eksi)} kurum)")
+    if koordine:
+        gizlilik.append(f"koordine küme şüphesi ({len(koordine)} bulgu)")
+    if gizlilik:
+        satirlar.append("Soru4 [Gizli/Yalnız?]: " + "; ".join(gizlilik)
+                        + " → niyet saklanıyor / organize hareket olabilir.")
+    else:
+        satirlar.append("Soru4 [Gizli/Yalnız?]: Belirgin virman/eksi takas/koordinasyon yok "
+                        "→ hareket görece açık.")
+
+    # Soru 5 — Resim
+    parca = []
+    if oyuncular:
+        parca.append(oyuncular[0].get("ad"))
+    if maliyet_bandi:
+        parca.append(f"{maliyet_bandi} maliyetten")
+    if patron_cikis:
+        parca.append("dağıtım evresinde")
+    elif na > ns:
+        parca.append("toplama evresinde")
+    elif ns > na:
+        parca.append("dağıtım evresinde")
+    if virman or eksi:
+        parca.append("gizlenerek")
+    if koordine:
+        parca.append("kümeyle")
+    if parca:
+        satirlar.append("Soru5 [RESİM]: " + ", ".join(str(p) for p in parca if p) + ".")
+    return satirlar
+
+
 def analiz(veri, hisse, esik, top, gunici=None):
     toplam_takas = sum(k["takas_son"] or 0 for k in veri)
     gurultu = esik * toplam_takas
@@ -301,7 +453,7 @@ def analiz(veri, hisse, esik, top, gunici=None):
 
     # --- 2) KESİN VİRMAN (iki-CSV) ya da ŞÜPHE (tek-CSV) ------------------ #
     if iki_csv:
-        net_map, ad_map, yontem = gunici
+        net_map, ad_map, yontem, alis_map, satis_map = gunici
         virman = kesin_virman_bolumu(veri, net_map, ad_map, yontem, toplam_takas, top)
         virman_bulgu = [f"{k['ad']} (takas {fmt(af)}, gün içi net {fmt(net)})"
                         for k, af, net in virman]
@@ -417,6 +569,35 @@ def analiz(veri, hisse, esik, top, gunici=None):
         _sinyal_ekle(sinyaller, k["ad"], "eksi takas")
     guven = capraz_dogrulama(hisse, sinyaller, [], top=top)
 
+    # --- [♦♦] ALAN VAR SATAN YOK ANOMALİSİ (iki-CSV, AKD alış/satış varsa) --- #
+    if iki_csv and len(gunici) >= 5:
+        _net, _ad, _yontem, alis_map, satis_map = gunici
+        anom = alan_satan_anomalisi(alis_map, satis_map, _ad, top=5)
+        if anom is not None:
+            baslik("[♦♦] 'ALAN VAR SATAN YOK' ANOMALİSİ — dolaşıma giriş / bölünme şüphesi")
+            print("Mantık: normal alımda biri satmalı. Tahtanın toplam satışı, toplam alışına göre")
+            print("çok küçükse → lot piyasadan değil dolaşımdan/bölünmeden gelmiş olabilir.")
+            print(f"  Toplam alış: {fmt(anom['toplam_alis'])} | Toplam satış: {fmt(anom['toplam_satis'])} "
+                  f"| satış/alış oranı: %{anom['satis_oran']*100:.0f}")
+            if anom["anomali"]:
+                print("  ⚠️  ANOMALİ: toplam satış, alışın %30'undan az → bölünme/dolaşıma giriş İHTİMALİ.")
+                print("     Bu dönemde bedelsiz/sermaye artırımı olmuş mu KAP/MCP BORSA'dan DOĞRULA.")
+            else:
+                print("  Belirgin anomali yok (satış-alış dengesi makul).")
+
+    # --- [★] HAM SENTEZ (aracın kalbi: 5 soru → resim) ------------------- #
+    baslik("[★] HAM SENTEZ — boyutlar tek resimde (5 soru) | OLGUSAL, karar yok")
+    _bulgu_sentez = {
+        "oyuncular": oyuncular, "net_alici": alicilar, "net_satici": saticilar,
+        "koordine": koordine_ozet, "virman_list": (virman if iki_csv else []),
+        "eksi_takas": eksi, "maliyet_bandi": maliyet_bandi, "patron_cikis": cikislar,
+    }
+    for s in sentez_uret(_bulgu_sentez):
+        print("  " + s)
+    print("\n  [ÇIKARIM — öneri, dayatma değil; kullanıcı katılmayabilir]")
+    print("  Yukarıdaki resimde en güçlü sinyal hangi boyuttaysa oraya odaklanmak mantıklı olabilir.")
+    print("  Kontrol/yön senin: 'şu boyutu aç', 'şu kuruma bak', 'şu yanlış' diyebilirsin.")
+
     print("\n" + "#" * 70)
     print("#  Son söz: Araç işaret verir, KARAR İNSANA AİTTİR.  (AL/SAT tavsiyesi yoktur.)")
     print("#" * 70)
@@ -443,6 +624,8 @@ def analiz(veri, hisse, esik, top, gunici=None):
         "net_satici": net_satici_bulgu,
         "guven": guven,
         "koordine": koordine_ozet,
+        "patron_cikis": cikislar,
+        "eksi_takas": eksi,
     }
 
 
@@ -837,6 +1020,29 @@ def karsilastir(dosya_etiketler, hisse, aralik=None, top=15):
     for iv in araliklar:
         koordine_ozet += koordine_kume_bolumu(iv["veri"], iv["etiket"])
 
+    # --- [♦♦♦] CEP OLAYI KONTROLÜ (maliyet uçurumu: geçmiş ucuz vs şimdi pahalı) --- #
+    veriler_aralikli = []
+    for iv in araliklar:
+        dmap = {}
+        for k in iv["veri"]:
+            dmap[k["key"]] = {
+                "ad": k["ad"], "maliyet": k.get("maliyet"),
+                "adet_fark": k.get("adet_fark"), "takas_son": k.get("takas_son"),
+            }
+        veriler_aralikli.append((iv["etiket"], dmap))
+    cep = cep_olayi_kontrol(veriler_aralikli)
+    baslik("[♦♦♦] CEP OLAYI ŞÜPHESİ — maliyeti yapay yükseltip dağıtım (geçmiş ucuz, şimdi pahalı)")
+    print("Mantık: aynı kurum geçmişte düşük maliyetle toplamışken, dar/son dönemde çok daha")
+    print("yüksek maliyetten 'yeni' görünüyorsa → sağ cep-sol cep (maliyet ilüzyonu) olabilir.")
+    if cep:
+        for c in cep[:top]:
+            print(f"  ⚠️  {c['ad']:<22} eski maliyet ~{fmt(c['eski_maliyet'],2)} → "
+                  f"yeni ~{fmt(c['yeni_maliyet'],2)} (×{c['ucurum_kat']:.2f})")
+        print("  → GÖSTERE GÖSTERE yüksek maliyet + geçmişte ucuz toplama = cep olayı ihtimali.")
+        print("     Geçmiş veriyle (mavi bölge) doğrula; gerçek maliyet eski/düşük olabilir.")
+    else:
+        print("  Belirgin maliyet uçurumu yok (cep olayı sinyali zayıf) ya da tek aralık.")
+
     # --- ÇAPRAZ DOĞRULAMA (Modül 4 / Faz 3) ----------------------------- #
     sinyaller = {}
     for s in kalici:
@@ -886,6 +1092,160 @@ def karsilastir(dosya_etiketler, hisse, aralik=None, top=15):
     print(f"\n→ {yol} dosyasına kaydedildi.")
 
 
+# ================================================================== #
+# GÜN GÜN ANALİZ + T+2 HİZALAMA (Anayasa: gün gün analizin temeli)
+# AKD'nin T günü ↔ Hızlı Takas'ın T+2 İŞ GÜNÜ ile eşleşir.
+# ================================================================== #
+import re as _re
+
+def _tarih_oku(dosya_adi):
+    """Dosya adından tarih çıkar: 2026-03-15 / 2026_03_15 / 15-03-2026 / 20260315."""
+    t = os.path.basename(dosya_adi)
+    # YYYY-MM-DD veya YYYY_MM_DD
+    m = _re.search(r"(20\d{2})[-_.](\d{1,2})[-_.](\d{1,2})", t)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+    # DD-MM-YYYY
+    m = _re.search(r"(\d{1,2})[-_.](\d{1,2})[-_.](20\d{2})", t)
+    if m:
+        try:
+            return datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        except ValueError:
+            pass
+    # YYYYMMDD
+    m = _re.search(r"(20\d{2})(\d{2})(\d{2})", t)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+    return None
+
+
+def _is_gunu_ekle(tarih, gun=2):
+    """T+gun İŞ GÜNÜ hesapla (hafta sonu atlanır). NOT: BİST resmi tatilleri
+    henüz dahil değil (ANA_MANTIK: sonra çözülecek). Şimdilik yalnız hafta sonu."""
+    from datetime import timedelta
+    d = tarih
+    eklendi = 0
+    while eklendi < gun:
+        d = d + timedelta(days=1)
+        if d.weekday() < 5:  # 0-4 = Pzt-Cuma
+            eklendi += 1
+    return d
+
+
+def gungun(akd_dosyalar, takas_dosyalar, hisse, top=15, hizali=False):
+    """Gün gün analiz: her AKD gününü (T) T+2 iş günü takasıyla eşleştirir.
+    akd_dosyalar, takas_dosyalar: dosya yolu listeleri (tarih adından okunur).
+    hizali=True ise kullanıcı zaten eşleştirmiş kabul edilir (sırayla birebir)."""
+    print("#" * 70)
+    print(f"#  GÜN GÜN ANALİZ + T+2 HİZALAMA — {hisse or '(hisse verilmedi)'}")
+    print("#" * 70)
+    print("Mantık: AKD'nin T günü işlemleri, Hızlı Takas'a T+2 İŞ GÜNÜ sonra yansır.")
+    print("Her gün: AKD(T) ile Takas(T+2) kıyaslanır → gün sonu ne kaldı, virman var mı.")
+    print("UYARI: Bu araç yalnız İŞARET üretir, AL/SAT TAVSİYESİ VERMEZ. Karar insana aittir.")
+
+    # Tarihleri oku
+    akd_list = [(_tarih_oku(d), d) for d in akd_dosyalar]
+    takas_list = [(_tarih_oku(d), d) for d in takas_dosyalar]
+
+    eslesme = []  # (akd_tarih, akd_dosya, takas_tarih, takas_dosya, durum)
+
+    if hizali:
+        # Kullanıcı hizalamış: sırayla birebir eşle
+        if len(akd_dosyalar) != len(takas_dosyalar):
+            print("\n⚠️  --hizali modunda AKD ve takas dosya SAYISI eşit olmalı (sırayla eşleşir).")
+            return
+        for (at, ad), (tt, td) in zip(akd_list, takas_list):
+            eslesme.append((at, ad, tt, td, "kullanıcı hizaladı"))
+    else:
+        # Araç hizalar: her AKD için T+2 iş günü, takas dosyalarında o tarihi ara
+        takas_by_date = {}
+        belirsiz = False
+        for tt, td in takas_list:
+            if tt is None:
+                belirsiz = True
+            else:
+                takas_by_date[tt.date()] = td
+        if belirsiz or any(at is None for at, _ in akd_list):
+            print("\n⚠️  Bazı dosya adlarından TARİH okunamadı. Araç emin değil → SORU:")
+            print("    Dosya adlarına tarih ekle (ör. AKD_2026-03-15.csv, TAKAS_2026-03-17.csv)")
+            print("    ya da zaten elle eşleştirdiysen --hizali bayrağını kullan.")
+            for at, ad in akd_list:
+                print(f"      AKD: {os.path.basename(ad)} → tarih: {at.date() if at else 'OKUNAMADI'}")
+            for tt, td in takas_list:
+                print(f"      TAKAS: {os.path.basename(td)} → tarih: {tt.date() if tt else 'OKUNAMADI'}")
+            return
+        for at, ad in akd_list:
+            hedef = _is_gunu_ekle(at, 2).date()
+            if hedef in takas_by_date:
+                eslesme.append((at, ad, hedef, takas_by_date[hedef], "araç T+2 eşledi"))
+            else:
+                eslesme.append((at, ad, hedef, None, f"T+2={hedef} için takas dosyası YOK"))
+
+    # Eşleşmeleri sırala ve işle
+    eslesme.sort(key=lambda e: (e[0] or datetime.min))
+    print(f"\nToplam {len(eslesme)} gün eşleştirildi:\n")
+
+    gunluk_ozet = []
+    for at, ad, tt, td, durum in eslesme:
+        ats = at.date() if at else "?"
+        print(baslik_str(f"GÜN: AKD {ats} ↔ Takas {tt}  [{durum}]"))
+        if td is None:
+            print("  ⚠️  Bu güne karşılık T+2 takas dosyası yok; atlanıyor.")
+            continue
+        # Veriyi oku
+        try:
+            veri = takas_oku(td)
+            net_map, ad_map, yontem, alis_map, satis_map = gunici_oku(ad)
+        except SystemExit as e:
+            print(f"  ⚠️  Dosya okunamadı: {e}")
+            continue
+        toplam_takas = sum(k["takas_son"] or 0 for k in veri)
+        # Her kurum: AKD net ile takas adet fark uyumu (gün sonu ne kaldı)
+        uyumsuz = []  # AKD'de işlem var ama takasa yansımamış (virman şüphesi)
+        for k in veri:
+            af = k["adet_fark"] or 0
+            net = net_map.get(k["key"])
+            if net is None:
+                continue
+            # AKD net büyük ama takas adet fark çok küçük (ya da ters) → virman
+            if abs(net) > 0.005 * toplam_takas and abs(af) < abs(net) * 0.30:
+                uyumsuz.append((k["ad"], net, af))
+        en_aktif = sorted(veri, key=lambda k: -abs(k["adet_fark"] or 0))[:5]
+        print("  En aktif (Adet Fark):")
+        for k in en_aktif:
+            if abs(k["adet_fark"] or 0) < 0.005 * toplam_takas:
+                break
+            yon = "ALIŞ" if (k["adet_fark"] or 0) > 0 else "SATIŞ"
+            print(f"    {k['ad']:<22} {_af_imzali(k['adet_fark'] or 0):>13} | {yon} | tip:{k['tip']}")
+        if uyumsuz:
+            print("  ⚠️  AKD-Takas UYUMSUZ (gün içi işlem takasa yansımamış = virman şüphesi):")
+            for ad_, net, af in uyumsuz[:5]:
+                print(f"    {ad_:<22} AKD net {_af_imzali(net):>13} ama takas farkı {_af_imzali(af):>13}")
+            gunluk_ozet.append(f"{ats}: {len(uyumsuz)} kurumda AKD-takas uyumsuz (virman şüphesi)")
+        else:
+            print("  ✓ AKD ile takas büyük ölçüde uyumlu (belirgin virman yok).")
+
+    # Gün gün özet (yön/evre seyri)
+    print("\n" + baslik_str("[★] GÜN GÜN ÖZET — operasyonun seyri"))
+    if gunluk_ozet:
+        for g in gunluk_ozet:
+            print(f"  • {g}")
+    else:
+        print("  Günlük bazda belirgin virman/uyumsuzluk işareti yok.")
+    print("\n  [Not] Gün gün veri arttıkça (ilk girişten bugüne) oyuncunun toplama→dağıtım")
+    print("  seyri netleşir. Eksik günler eklendikçe resim güçlenir.")
+
+    print("\n" + "#" * 70)
+    print("#  Son söz: Araç işaret verir, KARAR İNSANA AİTTİR.  (AL/SAT tavsiyesi yoktur.)")
+    print("#" * 70)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Takas işaret aracı (AL/SAT demez). Tek CSV=şüphe, --gunici ile=KESİN virman.")
@@ -894,12 +1254,24 @@ def main():
     ap.add_argument("--gunici", default=None, help="Gün içi aracı kurum dağılımı CSV (KESİN virman için)")
     ap.add_argument("--karsilastir", nargs="+", default=None, metavar="DOSYA:ETIKET",
                     help="Çoklu aralık karşılaştırma: 'dosya:etiket' (geniş→dar sırada, en az 2)")
+    ap.add_argument("--gungun-akd", nargs="+", default=None, metavar="AKD_CSV",
+                    help="Gün gün modu: AKD (gün içi) CSV'leri; dosya adında tarih (ör. AKD_2026-03-15.csv)")
+    ap.add_argument("--gungun-takas", nargs="+", default=None, metavar="TAKAS_CSV",
+                    help="Gün gün modu: Hızlı Takas CSV'leri; dosya adında tarih (T+2 eşleşir)")
+    ap.add_argument("--hizali", action="store_true",
+                    help="Gün gün modunda: dosyaları ZATEN elle eşleştirdiysen (sırayla birebir)")
     ap.add_argument("--hisse", default=None, help="Hisse etiketi (CSV'de sembol yok; sadece başlık)")
     ap.add_argument("--esik", type=float, default=0.01, help="Gürültü eşiği (toplam takas oranı; vars. 0.01)")
     ap.add_argument("--top", type=int, default=15, help="Listelerde gösterilecek satır sayısı")
     ap.add_argument("--aralik", default=None,
                     help="Veri aralığı (serbest metin, örn. '2026 Nisan'); deftere yazılır")
     a = ap.parse_args()
+
+    if a.gungun_akd or a.gungun_takas:
+        if not (a.gungun_akd and a.gungun_takas):
+            ap.error("Gün gün modu için HEM --gungun-akd HEM --gungun-takas gerekli.")
+        gungun(a.gungun_akd, a.gungun_takas, a.hisse, top=a.top, hizali=a.hizali)
+        return
 
     if a.karsilastir:
         karsilastir(a.karsilastir, a.hisse, aralik=a.aralik, top=a.top)
